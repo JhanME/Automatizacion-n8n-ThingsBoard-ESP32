@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #if defined(ESP32)
 #include <WiFi.h>
 #endif
@@ -9,125 +8,123 @@
 #include <ThingsBoard.h>
 #include "secrets.h"
 
-// Configuración de pines
+// --- Configuración ---
 #define BUTTON_PIN 4
 #define LED_BUILTIN 2
+const char* DEVICE_ID = "AG-LIMA-001";
+const char* LOCATION_VAL = "Laboratorio Central - UPCH";
 
-// Configuración de tiempos
 #define DEBOUNCE_DELAY 50
-constexpr int16_t TELEMETRY_SEND_INTERVAL = 2000;
-constexpr uint32_t MAX_MESSAGE_SIZE = 256U;
+constexpr int16_t TELEMETRY_SEND_INTERVAL = 5000;
+constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 
-// Atributos compartidos
-constexpr const char LED_ATTR[] = "led";
-constexpr const char COMMAND_ATTR[] = "command";
+// Contador para generar alarmId único por sesión
+unsigned long alarmCounter = 0;
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
 Shared_Attribute_Update<2U, 2U> shared_update;
-
 const std::array<IAPI_Implementation*, 1U> apis = { &shared_update };
-
 ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE, Default_Max_Stack_Size, apis);
 
+// --- Variables de Estado ---
 int lastButtonState = HIGH;
 int currentButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 unsigned long lastTelemetrySend = 0;
-bool ledState = false;
-float temperature = 25.0;
-float humidity = 60.0;
+float temperature = 24.0;
 int uptime = 0;
+bool alertaEnviada = false; 
 
 void InitWiFi() {
-  Serial.println("Conectando a WiFi...");
   WiFi.begin(WIFI_NAME, WIFI_CONTRA);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConectado");
-}
-
-const bool reconnect() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  InitWiFi();
-  return true;
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
 }
 
 void processSharedAttributes(const JsonObjectConst &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), LED_ATTR) == 0) {
-      ledState = it->value().as<bool>();
-      digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
-    }
-  }
+  if (data.containsKey("led")) digitalWrite(LED_BUILTIN, data["led"].as<bool>() ? HIGH : LOW);
 }
 
-constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = { LED_ATTR, COMMAND_ATTR };
-const Shared_Attribute_Callback<2U> attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
+constexpr std::array<const char *, 2U> SHARED_ATTRS = {"led", "command"};
+const Shared_Attribute_Callback<2U> attributes_callback(&processSharedAttributes, SHARED_ATTRS.cbegin(), SHARED_ATTRS.cend());
 
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
   InitWiFi();
-  configTime(0, 0, "pool.ntp.org");
+  configTime(-18000, 0, "pool.ntp.org");
 }
 
 void loop() {
-  if (!reconnect()) return;
-
+  if (WiFi.status() != WL_CONNECTED) InitWiFi();
   if (!tb.connected()) {
-    if (!tb.connect(TG_SERVER, TG_TOKEN, 1883U)) {
-      delay(5000);
-      return;
-    }
+    if (!tb.connect(TG_SERVER, TG_TOKEN, 1883U)) return;
     shared_update.Shared_Attributes_Subscribe(attributes_callback);
   }
 
+  // --- 1. LÓGICA DE ALARMA (Solo se envía UN mensaje a n8n) ---
   int reading = digitalRead(BUTTON_PIN);
   if (reading != lastButtonState) lastDebounceTime = millis();
 
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
     if (reading != currentButtonState) {
       currentButtonState = reading;
-      int buttonValue = (currentButtonState == LOW) ? 1 : 0;
-      
-      // SOLUCIÓN AL ERROR: Especificamos <2U> en la llamada
-      std::array<Telemetry, 2U> button_packet = {
-        Telemetry("button", (float)buttonValue),
-        Telemetry("temperature", temperature)
-      };
-      tb.sendTelemetry<2U>(button_packet.cbegin(), button_packet.cend());
+      if (currentButtonState == LOW && !alertaEnviada) {
+        temperature = 38.5;
+        alertaEnviada = true;
+        alarmCounter++;
 
-      if (buttonValue == 1) temperature = 35.0 + (random(0, 50) / 10.0);
+        // Generar alarmId único: DEVICE_ID-millis-contador
+        char alarmId[64];
+        snprintf(alarmId, sizeof(alarmId), "%s-%lu-%lu", DEVICE_ID, millis(), alarmCounter);
+
+        unsigned long ts = millis(); // timestamp en ms desde boot (NTP se puede usar si se requiere epoch)
+
+        Serial.println(">>> DISPARANDO WEBHOOK N8N (UNA SOLA VEZ) <<<");
+        Serial.printf("alarmId: %s | severity: CRITICAL\n", alarmId);
+
+        // Payload estándar: deviceId, ts, values (temp + humidity), severity, alarmId
+        std::array<Telemetry, 7U> alarm_packet = {
+          Telemetry("deviceId", DEVICE_ID),
+          Telemetry("ts", (float)ts),
+          Telemetry("temp", temperature),
+          Telemetry("humidity", 60.0f + (random(-10, 10) / 10.0f)),
+          Telemetry("severity", "CRITICAL"),
+          Telemetry("alarmId", alarmId),
+          Telemetry("alarm", 1.0f)  // Flag para el filtro de ThingsBoard Rule Chain
+        };
+        tb.sendTelemetry<7U>(alarm_packet.cbegin(), alarm_packet.cend());
+      }
+      else if (currentButtonState == HIGH) {
+        alertaEnviada = false;
+      }
     }
   }
   lastButtonState = reading;
 
+  // --- 2. TELEMETRÍA PERIÓDICA (No dispara n8n) ---
   if (millis() - lastTelemetrySend >= TELEMETRY_SEND_INTERVAL) {
     lastTelemetrySend = millis();
     uptime++;
 
-    if (temperature > 30.0) temperature -= 0.5;
-    else temperature = 25.0 + (random(-20, 50) / 10.0);
-    humidity = 60.0 + (random(-100, 100) / 10.0);
+    if (temperature > 25.0) temperature -= 2.0;
 
-    int alarmStatus = (temperature > 30.0) ? 1 : 0;
-    int buttonValue = (currentButtonState == LOW) ? 1 : 0;
+    unsigned long ts = millis();
 
-    // SOLUCIÓN AL ERROR: Especificamos <5U> en la llamada
-    std::array<Telemetry, 5U> t_data = {
-      Telemetry("temperature", temperature),
-      Telemetry("humidity",    humidity),
-      Telemetry("button",      (float)buttonValue),
-      Telemetry("uptime",      (float)uptime),
-      Telemetry("alarm",       (float)alarmStatus)
+    // Payload estándar periódico: deviceId, ts, values (temp + humidity + uptime), severity INFO, sin alarmId
+    std::array<Telemetry, 7U> t_data = {
+      Telemetry("deviceId", DEVICE_ID),
+      Telemetry("ts", (float)ts),
+      Telemetry("temp", temperature),
+      Telemetry("humidity", 60.0f + (random(-10, 10) / 10.0f)),
+      Telemetry("uptime_min", (float)uptime * (TELEMETRY_SEND_INTERVAL / 60000.0f)),
+      Telemetry("severity", "INFO"),
+      Telemetry("alarm", 0.0f)  // No dispara n8n
     };
 
-    Serial.println("Enviando paquete completo...");
-    tb.sendTelemetry<5U>(t_data.cbegin(), t_data.cend());
+    Serial.printf("Monitor de Rutina - Temp: %.2f\n", temperature);
+    tb.sendTelemetry<7U>(t_data.cbegin(), t_data.cend());
   }
 
   tb.loop();
